@@ -1,22 +1,40 @@
 export type MaterialType = 'wall' | 'mud' | 'metal' | 'water' | 'empty' | 'exit' | 'artifact';
 
+export type MediumType = 'air' | 'water' | 'mud' | 'solid';
+
 export type WaveType = 'knock' | 'whistle';
 
 export type GamePhase = 'menu' | 'playing' | 'paused' | 'won' | 'lost';
 
 export type QualityLevel = 'low' | 'medium' | 'high';
 
+export interface AcousticProperties {
+  density: number;
+  soundSpeed: number;
+  impedance: number;
+  absorptionCoeff: number;
+  transmissionLoss: number;
+}
+
 export interface MaterialProperties {
-  reflectivity: number;
-  absorption: number;
-  diffraction: number;
   color: string;
   decayRate: number;
   echoCount: number;
   walkable: boolean;
-  refractiveIndex?: number;
-  transmission?: number;
-  soundSpeedMultiplier?: number;
+  diffractionCoeff: number;
+  medium: MediumType;
+  acoustic: AcousticProperties;
+  isTransparent: boolean;
+}
+
+export interface InterfaceInteraction {
+  pressureReflectionCoeff: number;
+  intensityReflectionCoeff: number;
+  pressureTransmissionCoeff: number;
+  intensityTransmissionCoeff: number;
+  refractedAngle: number;
+  totalReflection: boolean;
+  criticalAngle: number;
 }
 
 export interface TerrainCell {
@@ -34,15 +52,18 @@ export interface WaveParticle {
   vx: number;
   vy: number;
   amplitude: number;
+  intensity: number;
   frequency: number;
   age: number;
   maxAge: number;
   color: string;
-  bounced: boolean;
+  bounceCount: number;
   sourceType: WaveType;
   trail: { x: number; y: number; age: number }[];
-  inWater: boolean;
-  originalSpeed: number;
+  currentMedium: MediumType;
+  baseSpeed: number;
+  phase: number;
+  wavelength: number;
 }
 
 export interface Player {

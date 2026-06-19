@@ -1,7 +1,7 @@
-import type { WaveParticle, WaveType, CollisionResult, QualityLevel } from '../types/game';
-import { WAVE_CONFIGS, MATERIAL_PROPERTIES, QUALITY_SETTINGS } from '../utils/materials';
+import type { WaveParticle, WaveType, CollisionResult, QualityLevel, MediumType, InterfaceInteraction } from '../types/game';
+import { WAVE_CONFIGS, MATERIAL_PROPERTIES, QUALITY_SETTINGS, MEDIUM_PROPERTIES, computeInterfaceInteraction } from '../utils/materials';
 import { TerrainSystem } from './TerrainSystem';
-import { reflect, normalize, randomRange, clamp, refract, distance } from '../utils/math';
+import { reflect, normalize, randomRange, clamp, dot } from '../utils/math';
 
 interface DiffractionSource {
   x: number;
@@ -12,6 +12,8 @@ interface DiffractionSource {
   frequency: number;
   color: string;
   age: number;
+  medium: MediumType;
+  baseSpeed: number;
 }
 
 export class WaveEngine {
@@ -57,21 +59,31 @@ export class WaveEngine {
       vx: 0,
       vy: 0,
       amplitude: 0,
+      intensity: 0,
       frequency: 0,
       age: 0,
       maxAge: 0,
       color: '',
-      bounced: false,
+      bounceCount: 0,
       sourceType: 'knock',
       trail: [],
-      inWater: false,
-      originalSpeed: 0,
+      currentMedium: 'air',
+      baseSpeed: 0,
+      phase: 0,
+      wavelength: 0,
     };
   }
 
   private returnParticle(particle: WaveParticle): void {
     particle.trail = [];
     this.particlePool.push(particle);
+  }
+
+  private getMediumSpeed(medium: MediumType, baseSpeed: number): number {
+    const mediumProps = MEDIUM_PROPERTIES[medium];
+    const airSpeed = MEDIUM_PROPERTIES.air.soundSpeed;
+    const speedRatio = mediumProps.soundSpeed / airSpeed;
+    return baseSpeed * speedRatio;
   }
 
   public emitWave(worldX: number, worldY: number, type: WaveType): void {
@@ -87,28 +99,32 @@ export class WaveEngine {
     }
 
     const startCell = this.terrainSystem.getCellAtWorldPos(worldX, worldY);
-    const startInWater = startCell?.type === 'water';
+    const startMedium = startCell ? MATERIAL_PROPERTIES[startCell.type].medium : 'air';
+    const baseSpeed = config.speed;
+    const mediumSpeed = this.getMediumSpeed(startMedium, baseSpeed);
 
     for (let i = 0; i < particleCount; i++) {
-      const angle = (i / particleCount) * Math.PI * 2 + randomRange(-0.05, 0.05);
-      const baseSpeed = config.speed * randomRange(0.9, 1.1);
-      const speed = startInWater ? baseSpeed * (MATERIAL_PROPERTIES.water.soundSpeedMultiplier || 0.7) : baseSpeed;
+      const angle = (i / particleCount) * Math.PI * 2 + randomRange(-0.03, 0.03);
+      const speed = mediumSpeed * randomRange(0.95, 1.05);
       const particle = this.getParticle();
 
       particle.x = worldX;
       particle.y = worldY;
       particle.vx = Math.cos(angle) * speed;
       particle.vy = Math.sin(angle) * speed;
-      particle.amplitude = config.amplitude * randomRange(0.8, 1.2);
+      particle.amplitude = config.amplitude * randomRange(0.9, 1.1);
+      particle.intensity = particle.amplitude * particle.amplitude;
       particle.frequency = config.frequency;
       particle.age = 0;
       particle.maxAge = config.maxAge;
       particle.color = config.color;
-      particle.bounced = false;
+      particle.bounceCount = 0;
       particle.sourceType = type;
       particle.trail = [];
-      particle.inWater = startInWater;
-      particle.originalSpeed = baseSpeed;
+      particle.currentMedium = startMedium;
+      particle.baseSpeed = baseSpeed;
+      particle.phase = randomRange(0, Math.PI * 2);
+      particle.wavelength = speed / config.frequency;
 
       this.particles.push(particle);
     }
@@ -131,8 +147,9 @@ export class WaveEngine {
       p.x += p.vx * deltaTime;
       p.y += p.vy * deltaTime;
       p.age += deltaTime;
+      p.phase += (2 * Math.PI * p.frequency * deltaTime) % (Math.PI * 2);
 
-      if (p.trail.length > 5) {
+      if (p.trail.length > 6) {
         p.trail.shift();
       }
       p.trail.push({ x: prevX, y: prevY, age: p.age - deltaTime });
@@ -140,23 +157,30 @@ export class WaveEngine {
       const collision = this.terrainSystem.checkWaveCollision(p.x, p.y, prevX, prevY);
 
       if (collision.collided) {
-        this.handleCollision(p, collision, prevX, prevY, newParticles);
+        this.handleInterfaceInteraction(p, collision, prevX, prevY, newParticles);
       }
 
       const cellSize = this.terrainSystem.getCellSize();
-      const revealRadius = 20 + p.amplitude * 30;
-      this.terrainSystem.revealArea(p.x, p.y, revealRadius, p.amplitude * 0.3);
+      const revealRadius = 15 + Math.sqrt(p.intensity) * 25;
+      this.terrainSystem.revealArea(p.x, p.y, revealRadius, p.amplitude * 0.25);
 
-      if (this.onWaveHeard && !p.bounced) {
-        this.onWaveHeard(p.x, p.y, p.amplitude * 0.5, p.sourceType);
+      if (this.onWaveHeard && p.bounceCount < 2) {
+        this.onWaveHeard(p.x, p.y, p.amplitude * 0.4, p.sourceType);
       }
 
-      const decayRate = this.terrainSystem.getCellAtWorldPos(p.x, p.y)
-        ? MATERIAL_PROPERTIES[this.terrainSystem.getCellAtWorldPos(p.x, p.y)!.type].decayRate
-        : 0.01;
-      p.amplitude -= decayRate * deltaTime * 60;
+      const currentCell = this.terrainSystem.getCellAtWorldPos(p.x, p.y);
+      if (currentCell) {
+        const matProps = MATERIAL_PROPERTIES[currentCell.type];
+        const absorption = matProps.acoustic.absorptionCoeff * 0.1;
+        p.amplitude -= absorption * deltaTime * 60;
+        p.intensity = p.amplitude * p.amplitude;
 
-      if (p.age >= p.maxAge || p.amplitude <= 0.01) {
+        const decay = matProps.decayRate * deltaTime * 60;
+        p.amplitude -= decay;
+        p.intensity = p.amplitude * p.amplitude;
+      }
+
+      if (p.age >= p.maxAge || p.amplitude <= 0.008) {
         toRemove.push(i);
       }
     }
@@ -171,227 +195,238 @@ export class WaveEngine {
     this.particles.push(...newParticles);
   }
 
-  private handleCollision(
+  private handleInterfaceInteraction(
     p: WaveParticle,
     collision: CollisionResult,
     prevX: number,
     prevY: number,
     newParticles: WaveParticle[]
   ): void {
-    const materialProps = MATERIAL_PROPERTIES[collision.cellType];
-
     p.x = prevX;
     p.y = prevY;
 
-    if (collision.cellType === 'water' && materialProps.refractiveIndex !== undefined && materialProps.transmission !== undefined) {
-      this.handleWaterRefraction(p, collision, newParticles);
-      return;
+    const targetMat = MATERIAL_PROPERTIES[collision.cellType];
+    const sourceMediumProps = MEDIUM_PROPERTIES[p.currentMedium];
+    const targetMediumProps = MEDIUM_PROPERTIES[targetMat.medium];
+
+    const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+    const dirX = p.vx / speed;
+    const dirY = p.vy / speed;
+
+    const incidentAngle = Math.acos(clamp(-dot(dirX, dirY, collision.normalX, collision.normalY), -1, 1));
+
+    const interaction: InterfaceInteraction = computeInterfaceInteraction(
+      incidentAngle,
+      sourceMediumProps.impedance,
+      targetMediumProps.impedance,
+      sourceMediumProps.soundSpeed,
+      targetMediumProps.soundSpeed
+    );
+
+    const isTransparent = targetMat.isTransparent;
+
+    if (isTransparent && !interaction.totalReflection && interaction.intensityTransmissionCoeff > 0.05) {
+      this.handleTransmission(p, collision, interaction, targetMat.medium, newParticles);
+    } else {
+      this.handleReflection(p, collision, interaction, collision.cellType, newParticles);
     }
 
-    const enteringWater = !p.inWater && collision.cellType === 'water';
-    const exitingWater = p.inWater && collision.cellType !== 'water';
-
-    if (enteringWater && materialProps.refractiveIndex !== undefined && materialProps.transmission !== undefined) {
-      this.handleWaterRefraction(p, collision, newParticles);
-      return;
-    }
-
-    if (exitingWater) {
-      const airProps = MATERIAL_PROPERTIES.empty;
-      const n2 = 1 / (MATERIAL_PROPERTIES.water.refractiveIndex || 0.7);
-      const speedMult = 1 / (MATERIAL_PROPERTIES.water.soundSpeedMultiplier || 0.7);
-
-      const reflected = reflect(p.vx, p.vy, collision.normalX, collision.normalY);
-      const refracted = refract(p.vx, p.vy, collision.normalX, collision.normalY, n2);
-
-      if (refracted.totalReflection) {
-        p.vx = reflected.x;
-        p.vy = reflected.y;
-        p.amplitude *= 0.9;
-      } else {
-        const transmission = 0.7;
-        const reflection = 0.3;
-
-        p.vx = refracted.x * speedMult;
-        p.vy = refracted.y * speedMult;
-        p.amplitude *= transmission;
-        p.inWater = false;
-        p.color = '#1e90ff';
-
-        if (p.amplitude > 0.15 && reflection > 0.1) {
-          const reflectedParticle = this.getParticle();
-          reflectedParticle.x = p.x;
-          reflectedParticle.y = p.y;
-          reflectedParticle.vx = reflected.x;
-          reflectedParticle.vy = reflected.y;
-          reflectedParticle.amplitude = p.amplitude * reflection / transmission;
-          reflectedParticle.frequency = p.frequency;
-          reflectedParticle.age = p.age;
-          reflectedParticle.maxAge = p.maxAge;
-          reflectedParticle.color = '#1e90ff';
-          reflectedParticle.bounced = true;
-          reflectedParticle.sourceType = p.sourceType;
-          reflectedParticle.trail = [];
-          reflectedParticle.inWater = true;
-          reflectedParticle.originalSpeed = p.originalSpeed;
-          newParticles.push(reflectedParticle);
-        }
-      }
-
-      p.bounced = true;
-      p.amplitude = clamp(p.amplitude, 0, 1);
-
-      if (this.onReflection && p.amplitude > 0.1) {
-        this.onReflection('water', p.x, p.y, p.amplitude);
-      }
-      return;
-    }
-
-    const reflected = reflect(p.vx, p.vy, collision.normalX, collision.normalY);
-
-    p.vx = reflected.x * materialProps.reflectivity;
-    p.vy = reflected.y * materialProps.reflectivity;
-
-    p.amplitude *= materialProps.reflectivity;
-    p.amplitude -= materialProps.absorption;
-
-    if (!p.bounced) {
-      p.color = materialProps.color;
-    }
-    p.bounced = true;
-
-    if (this.onReflection && p.amplitude > 0.1) {
-      this.onReflection(collision.cellType, p.x, p.y, p.amplitude);
-    }
-
-    if (materialProps.diffraction > 0 && Math.random() < materialProps.diffraction * 0.3) {
+    if (targetMat.diffractionCoeff > 0 && Math.random() < targetMat.diffractionCoeff * 0.4) {
       this.diffractionSources.push({
         x: p.x,
         y: p.y,
         normalX: collision.normalX,
         normalY: collision.normalY,
-        amplitude: p.amplitude * materialProps.diffraction,
+        amplitude: p.amplitude * targetMat.diffractionCoeff,
         frequency: p.frequency,
         color: p.color,
         age: p.age,
+        medium: p.currentMedium,
+        baseSpeed: p.baseSpeed,
       });
     }
 
-    if (materialProps.echoCount > 0 && p.amplitude > 0.3) {
-      for (let e = 0; e < Math.min(materialProps.echoCount, 2); e++) {
-        const echoParticle = this.getParticle();
-        const spreadAngle = randomRange(-0.5, 0.5);
-        const cos = Math.cos(spreadAngle);
-        const sin = Math.sin(spreadAngle);
-        const echoVx = p.vx * cos - p.vy * sin;
-        const echoVy = p.vx * sin + p.vy * cos;
-
-        echoParticle.x = p.x;
-        echoParticle.y = p.y;
-        echoParticle.vx = echoVx * 0.8;
-        echoParticle.vy = echoVy * 0.8;
-        echoParticle.amplitude = p.amplitude * 0.5;
-        echoParticle.frequency = p.frequency;
-        echoParticle.age = p.age;
-        echoParticle.maxAge = p.maxAge - p.age + randomRange(0.5, 1.5);
-        echoParticle.color = p.color;
-        echoParticle.bounced = true;
-        echoParticle.sourceType = p.sourceType;
-        echoParticle.trail = [];
-        echoParticle.inWater = p.inWater;
-        echoParticle.originalSpeed = p.originalSpeed;
-
-        newParticles.push(echoParticle);
-      }
+    if (this.onReflection && p.amplitude > 0.08) {
+      this.onReflection(collision.cellType, p.x, p.y, p.amplitude);
     }
 
     p.amplitude = clamp(p.amplitude, 0, 1);
+    p.intensity = p.amplitude * p.amplitude;
   }
 
-  private handleWaterRefraction(
+  private handleReflection(
     p: WaveParticle,
     collision: CollisionResult,
+    interaction: InterfaceInteraction,
+    materialType: string,
     newParticles: WaveParticle[]
   ): void {
-    const waterProps = MATERIAL_PROPERTIES.water;
-    const n = waterProps.refractiveIndex || 0.7;
-    const transmission = waterProps.transmission || 0.7;
-    const reflection = 1 - transmission;
-    const speedMult = waterProps.soundSpeedMultiplier || 0.7;
-
     const reflected = reflect(p.vx, p.vy, collision.normalX, collision.normalY);
-    const refracted = refract(p.vx, p.vy, collision.normalX, collision.normalY, n);
+    const reflIntensity = p.intensity * interaction.intensityReflectionCoeff;
+    const reflAmplitude = Math.sqrt(Math.max(0, reflIntensity));
 
-    if (refracted.totalReflection) {
-      p.vx = reflected.x * waterProps.reflectivity;
-      p.vy = reflected.y * waterProps.reflectivity;
-      p.amplitude *= waterProps.reflectivity;
-      p.color = waterProps.color;
-      p.bounced = true;
-    } else {
-      p.vx = refracted.x * speedMult;
-      p.vy = refracted.y * speedMult;
-      p.amplitude *= transmission;
-      p.inWater = true;
-      p.color = waterProps.color;
-      p.bounced = true;
+    const matProps = MATERIAL_PROPERTIES[collision.cellType];
+    const absorbed = p.intensity * matProps.acoustic.absorptionCoeff * 0.3;
+    const finalAmplitude = Math.sqrt(Math.max(0, reflIntensity - absorbed));
 
-      if (p.amplitude > 0.15 && reflection > 0.1) {
-        const reflectedParticle = this.getParticle();
-        reflectedParticle.x = p.x;
-        reflectedParticle.y = p.y;
-        reflectedParticle.vx = reflected.x;
-        reflectedParticle.vy = reflected.y;
-        reflectedParticle.amplitude = p.amplitude * reflection / transmission;
-        reflectedParticle.frequency = p.frequency;
-        reflectedParticle.age = p.age;
-        reflectedParticle.maxAge = p.maxAge;
-        reflectedParticle.color = waterProps.color;
-        reflectedParticle.bounced = true;
-        reflectedParticle.sourceType = p.sourceType;
-        reflectedParticle.trail = [];
-        reflectedParticle.inWater = false;
-        reflectedParticle.originalSpeed = p.originalSpeed;
-        newParticles.push(reflectedParticle);
+    p.vx = reflected.x;
+    p.vy = reflected.y;
+    p.amplitude = finalAmplitude;
+    p.intensity = finalAmplitude * finalAmplitude;
+    p.bounceCount++;
+
+    if (p.bounceCount === 1) {
+      p.color = matProps.color;
+    }
+
+    if (matProps.echoCount > 0 && p.amplitude > 0.25) {
+      for (let e = 0; e < Math.min(matProps.echoCount, 3); e++) {
+        const echoParticle = this.createEchoParticle(p, collision, e);
+        if (echoParticle) {
+          newParticles.push(echoParticle);
+        }
       }
     }
+  }
 
-    if (this.onReflection && p.amplitude > 0.1) {
-      this.onReflection('water', p.x, p.y, p.amplitude);
+  private handleTransmission(
+    p: WaveParticle,
+    collision: CollisionResult,
+    interaction: InterfaceInteraction,
+    targetMedium: MediumType,
+    newParticles: WaveParticle[]
+  ): void {
+    const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+    const dirX = p.vx / speed;
+    const dirY = p.vy / speed;
+
+    const targetSpeed = this.getMediumSpeed(targetMedium, p.baseSpeed);
+
+    const tangentX = -collision.normalY;
+    const tangentY = collision.normalX;
+
+    const sinTheta2 = Math.sin(interaction.refractedAngle);
+    const cosTheta2 = Math.cos(interaction.refractedAngle);
+
+    const dirDotNormal = dot(dirX, dirY, collision.normalX, collision.normalY);
+    const sign = dirDotNormal < 0 ? -1 : 1;
+
+    const newDirX = tangentX * sinTheta2 + collision.normalX * cosTheta2 * sign;
+    const newDirY = tangentY * sinTheta2 + collision.normalY * cosTheta2 * sign;
+
+    const norm = Math.sqrt(newDirX * newDirX + newDirY * newDirY);
+    const unitDirX = newDirX / norm;
+    const unitDirY = newDirY / norm;
+
+    const transIntensity = p.intensity * interaction.intensityTransmissionCoeff;
+    const transAmplitude = Math.sqrt(Math.max(0, transIntensity));
+
+    const targetMat = MATERIAL_PROPERTIES[collision.cellType];
+    const lossAmplitude = transAmplitude * (1 - targetMat.acoustic.transmissionLoss);
+
+    p.vx = unitDirX * targetSpeed;
+    p.vy = unitDirY * targetSpeed;
+    p.amplitude = lossAmplitude;
+    p.intensity = lossAmplitude * lossAmplitude;
+    p.currentMedium = targetMedium;
+    p.color = targetMat.color;
+
+    if (interaction.intensityReflectionCoeff > 0.05 && p.amplitude > 0.1) {
+      const reflParticle = this.getParticle();
+      const reflected = reflect(p.vx / targetSpeed * speed, p.vy / targetSpeed * speed, collision.normalX, collision.normalY);
+      const reflAmplitude = Math.sqrt(p.intensity * interaction.intensityReflectionCoeff);
+
+      reflParticle.x = p.x;
+      reflParticle.y = p.y;
+      reflParticle.vx = reflected.x;
+      reflParticle.vy = reflected.y;
+      reflParticle.amplitude = reflAmplitude;
+      reflParticle.intensity = reflAmplitude * reflAmplitude;
+      reflParticle.frequency = p.frequency;
+      reflParticle.age = p.age;
+      reflParticle.maxAge = p.maxAge;
+      reflParticle.color = p.color;
+      reflParticle.bounceCount = p.bounceCount + 1;
+      reflParticle.sourceType = p.sourceType;
+      reflParticle.trail = [...p.trail];
+      reflParticle.currentMedium = p.currentMedium;
+      reflParticle.baseSpeed = p.baseSpeed;
+      reflParticle.phase = p.phase;
+      reflParticle.wavelength = p.wavelength;
+
+      newParticles.push(reflParticle);
     }
+  }
 
-    p.amplitude = clamp(p.amplitude, 0, 1);
+  private createEchoParticle(
+    p: WaveParticle,
+    collision: CollisionResult,
+    echoIndex: number
+  ): WaveParticle | null {
+    const matProps = MATERIAL_PROPERTIES[collision.cellType];
+    if (echoIndex >= matProps.echoCount) return null;
+
+    const echoParticle = this.getParticle();
+    const spreadAngle = randomRange(-0.4, 0.4);
+    const cos = Math.cos(spreadAngle);
+    const sin = Math.sin(spreadAngle);
+    const echoVx = p.vx * cos - p.vy * sin;
+    const echoVy = p.vx * sin + p.vy * cos;
+
+    const echoDecay = Math.pow(0.5, echoIndex + 1);
+    const echoAmplitude = p.amplitude * echoDecay;
+
+    echoParticle.x = p.x + echoVx * 0.02;
+    echoParticle.y = p.y + echoVy * 0.02;
+    echoParticle.vx = echoVx * 0.85;
+    echoParticle.vy = echoVy * 0.85;
+    echoParticle.amplitude = echoAmplitude;
+    echoParticle.intensity = echoAmplitude * echoAmplitude;
+    echoParticle.frequency = p.frequency;
+    echoParticle.age = p.age;
+    echoParticle.maxAge = p.maxAge - p.age + randomRange(0.3, 1.2);
+    echoParticle.color = p.color;
+    echoParticle.bounceCount = p.bounceCount + 1;
+    echoParticle.sourceType = p.sourceType;
+    echoParticle.trail = [];
+    echoParticle.currentMedium = p.currentMedium;
+    echoParticle.baseSpeed = p.baseSpeed;
+    echoParticle.phase = p.phase;
+    echoParticle.wavelength = p.wavelength;
+
+    return echoParticle;
   }
 
   private processDiffraction(newParticles: WaveParticle[]): void {
     for (const source of this.diffractionSources) {
-      const particleCount = Math.floor(4 * QUALITY_SETTINGS[this.quality].waveParticlesMultiplier);
+      const particleCount = Math.floor(5 * QUALITY_SETTINGS[this.quality].waveParticlesMultiplier);
+
+      const mediumSpeed = this.getMediumSpeed(source.medium, source.baseSpeed);
 
       for (let i = 0; i < particleCount; i++) {
         const baseAngle = Math.atan2(source.normalY, source.normalX);
-        const spread = (i / (particleCount - 1) - 0.5) * Math.PI * 0.8;
+        const spread = (i / (particleCount - 1) - 0.5) * Math.PI * 0.9;
         const angle = baseAngle + spread;
-        const baseSpeed = 150 * randomRange(0.8, 1.2);
-
-        const sourceCell = this.terrainSystem.getCellAtWorldPos(source.x, source.y);
-        const inWater = sourceCell?.type === 'water';
-        const speed = inWater ? baseSpeed * (MATERIAL_PROPERTIES.water.soundSpeedMultiplier || 0.7) : baseSpeed;
+        const speed = mediumSpeed * randomRange(0.85, 1.15);
 
         const diffractedParticle = this.getParticle();
-        diffractedParticle.x = source.x + source.normalX * 5;
-        diffractedParticle.y = source.y + source.normalY * 5;
+        diffractedParticle.x = source.x + source.normalX * 4;
+        diffractedParticle.y = source.y + source.normalY * 4;
         diffractedParticle.vx = Math.cos(angle) * speed;
         diffractedParticle.vy = Math.sin(angle) * speed;
-        diffractedParticle.amplitude = source.amplitude * 0.4;
+        diffractedParticle.amplitude = source.amplitude * 0.35;
+        diffractedParticle.intensity = diffractedParticle.amplitude * diffractedParticle.amplitude;
         diffractedParticle.frequency = source.frequency;
         diffractedParticle.age = source.age;
-        diffractedParticle.maxAge = 2;
+        diffractedParticle.maxAge = 1.8;
         diffractedParticle.color = source.color;
-        diffractedParticle.bounced = true;
+        diffractedParticle.bounceCount = 1;
         diffractedParticle.sourceType = 'knock';
         diffractedParticle.trail = [];
-        diffractedParticle.inWater = inWater;
-        diffractedParticle.originalSpeed = baseSpeed;
+        diffractedParticle.currentMedium = source.medium;
+        diffractedParticle.baseSpeed = source.baseSpeed;
+        diffractedParticle.phase = 0;
+        diffractedParticle.wavelength = speed / source.frequency;
 
         newParticles.push(diffractedParticle);
       }
