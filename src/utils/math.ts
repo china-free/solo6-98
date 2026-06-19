@@ -79,3 +79,29 @@ export const frequencyToColor = (frequency: number): string => {
   const b = Math.round(255 * t);
   return rgbToHex(r, g, b);
 };
+
+export const refract = (
+  vx: number,
+  vy: number,
+  nx: number,
+  ny: number,
+  refractiveIndex: number
+): { x: number; y: number; totalReflection: boolean } => {
+  const d = dot(vx, vy, nx, ny);
+  const n = refractiveIndex;
+  const k = 1 - n * n * (1 - d * d);
+
+  if (k < 0) {
+    return { x: 0, y: 0, totalReflection: true };
+  }
+
+  return {
+    x: n * vx - (n * d + Math.sqrt(k)) * nx,
+    y: n * vy - (n * d + Math.sqrt(k)) * ny,
+    totalReflection: false,
+  };
+};
+
+export const tangent = (nx: number, ny: number): { x: number; y: number } => {
+  return { x: -ny, y: nx };
+};

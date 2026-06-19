@@ -3,6 +3,7 @@ import type { WaveType } from '../types/game';
 export class AudioSystem {
   private audioContext: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private listener: AudioListener | null = null;
   private volume: number = 0.7;
   private enabled: boolean = true;
   private reverbBuffer: AudioBuffer | null = null;
@@ -17,12 +18,58 @@ export class AudioSystem {
       this.masterGain = this.audioContext.createGain();
       this.masterGain.gain.value = this.volume;
       this.masterGain.connect(this.audioContext.destination);
+      this.listener = this.audioContext.listener;
+
+      const listener = this.listener as AudioListener;
+      if ('forwardX' in listener && listener.forwardX) {
+        listener.forwardX.value = 0;
+        listener.forwardY.value = 0;
+        listener.forwardZ.value = -1;
+        listener.upX.value = 0;
+        listener.upY.value = 1;
+        listener.upZ.value = 0;
+      }
 
       await this.generateReverbImpulse();
     } catch (e) {
       console.warn('Web Audio API not supported');
       this.enabled = false;
     }
+  }
+
+  public updateListenerPosition(x: number, y: number): void {
+    if (!this.listener || !this.audioContext) return;
+
+    const worldScale = 0.01;
+    const listener = this.listener as AudioListener;
+
+    if ('positionX' in listener && listener.positionX) {
+      listener.positionX.setValueAtTime(x * worldScale, this.audioContext.currentTime);
+      listener.positionY.setValueAtTime(-y * worldScale, this.audioContext.currentTime);
+      listener.positionZ.setValueAtTime(0, this.audioContext.currentTime);
+    }
+  }
+
+  private createPanner(x: number, y: number, distanceModel: DistanceModelType = 'inverse'): PannerNode {
+    if (!this.audioContext) throw new Error('AudioContext not initialized');
+
+    const panner = this.audioContext.createPanner();
+    const worldScale = 0.01;
+
+    panner.panningModel = 'HRTF';
+    panner.distanceModel = distanceModel;
+    panner.refDistance = 0.5;
+    panner.maxDistance = 50;
+    panner.rolloffFactor = distanceModel === 'inverse' ? 1 : 0.5;
+
+    const pannerNode = panner as PannerNode;
+    if ('positionX' in pannerNode && pannerNode.positionX) {
+      pannerNode.positionX.setValueAtTime(x * worldScale, this.audioContext.currentTime);
+      pannerNode.positionY.setValueAtTime(-y * worldScale, this.audioContext.currentTime);
+      pannerNode.positionZ.setValueAtTime(0, this.audioContext.currentTime);
+    }
+
+    return panner;
   }
 
   private async generateReverbImpulse(): Promise<void> {
@@ -62,17 +109,19 @@ export class AudioSystem {
     }
   }
 
-  public playWaveSound(type: WaveType, distance: number = 0): void {
+  public playWaveSound(type: WaveType, sourceX: number, sourceY: number, listenerX: number, listenerY: number): void {
     if (!this.enabled || !this.audioContext || !this.masterGain) return;
 
     const baseFreq = type === 'knock' ? 80 : 1200;
     const duration = type === 'knock' ? 0.3 : 0.15;
     const volume = type === 'knock' ? 0.5 : 0.3;
-    const distanceFactor = Math.max(0.1, 1 - distance / 1000);
+    const dist = Math.sqrt((sourceX - listenerX) ** 2 + (sourceY - listenerY) ** 2);
+    const distanceFactor = Math.max(0.1, 1 - dist / 1000);
 
     const osc = this.audioContext.createOscillator();
     const gainNode = this.audioContext.createGain();
     const filter = this.audioContext.createBiquadFilter();
+    const panner = this.createPanner(sourceX, sourceY, 'inverse');
     const convolver = this.audioContext.createConvolver();
     const reverbGain = this.audioContext.createGain();
 
@@ -87,14 +136,18 @@ export class AudioSystem {
 
     filter.type = 'lowpass';
     filter.frequency.value = type === 'knock' ? 500 : 3000;
+    filter.frequency.exponentialRampToValueAtTime(
+      filter.frequency.value * distanceFactor,
+      this.audioContext.currentTime + duration
+    );
 
-    gainNode.gain.setValueAtTime(volume * distanceFactor, this.audioContext.currentTime);
+    gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
     gainNode.gain.exponentialRampToValueAtTime(
       0.001,
       this.audioContext.currentTime + duration
     );
 
-    reverbGain.gain.value = 0.3;
+    reverbGain.gain.value = 0.3 * distanceFactor;
 
     if (this.reverbBuffer) {
       convolver.buffer = this.reverbBuffer;
@@ -102,7 +155,8 @@ export class AudioSystem {
 
     osc.connect(filter);
     filter.connect(gainNode);
-    gainNode.connect(this.masterGain);
+    gainNode.connect(panner);
+    panner.connect(this.masterGain);
 
     filter.connect(convolver);
     convolver.connect(reverbGain);
@@ -112,78 +166,92 @@ export class AudioSystem {
     osc.stop(this.audioContext.currentTime + duration);
   }
 
-  public playReflectionSound(materialType: string, distance: number): void {
+  public playReflectionSound(materialType: string, sourceX: number, sourceY: number, listenerX: number, listenerY: number, amplitude: number): void {
     if (!this.enabled || !this.audioContext || !this.masterGain) return;
 
-    const volume = 0.15;
-    const distanceFactor = Math.max(0.1, 1 - distance / 800);
+    const volume = 0.15 * amplitude;
 
     const osc = this.audioContext.createOscillator();
     const gainNode = this.audioContext.createGain();
+    const panner = this.createPanner(sourceX, sourceY, 'linear');
+    const filter = this.audioContext.createBiquadFilter();
 
     let freq = 200;
     let duration = 0.1;
     let type: OscillatorType = 'sine';
+    let filterFreq = 2000;
 
     switch (materialType) {
       case 'wall':
         freq = 300;
         duration = 0.15;
         type = 'triangle';
+        filterFreq = 1500;
         break;
       case 'metal':
         freq = 800;
         duration = 0.4;
         type = 'sine';
+        filterFreq = 4000;
         break;
       case 'water':
         freq = 150;
-        duration = 0.2;
+        duration = 0.25;
         type = 'sine';
+        filterFreq = 800;
         break;
       case 'mud':
         freq = 100;
-        duration = 0.1;
+        duration = 0.12;
         type = 'sine';
+        filterFreq = 500;
         break;
       case 'artifact':
         freq = 600;
         duration = 0.3;
         type = 'sine';
+        filterFreq = 3000;
         break;
       case 'exit':
         freq = 500;
         duration = 0.5;
         type = 'sine';
+        filterFreq = 2500;
         break;
     }
 
     osc.type = type;
-    osc.frequency.value = freq;
+    osc.frequency.setValueAtTime(freq, this.audioContext.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.7, this.audioContext.currentTime + duration);
 
-    gainNode.gain.setValueAtTime(volume * distanceFactor, this.audioContext.currentTime);
+    filter.type = 'lowpass';
+    filter.frequency.value = filterFreq;
+
+    gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
     gainNode.gain.exponentialRampToValueAtTime(
       0.001,
       this.audioContext.currentTime + duration
     );
 
-    osc.connect(gainNode);
-    gainNode.connect(this.masterGain);
+    osc.connect(filter);
+    filter.connect(gainNode);
+    gainNode.connect(panner);
+    panner.connect(this.masterGain);
 
     osc.start();
     osc.stop(this.audioContext.currentTime + duration);
   }
 
-  public playMonsterSound(state: string, distance: number): void {
+  public playMonsterSound(state: string, sourceX: number, sourceY: number, listenerX: number, listenerY: number): void {
     if (!this.enabled || !this.audioContext || !this.masterGain) return;
 
-    const distanceFactor = Math.max(0.1, 1 - distance / 500);
     const volume = state === 'chase' ? 0.4 : state === 'alert' ? 0.2 : 0.1;
     const duration = state === 'chase' ? 0.2 : 0.15;
 
     const osc = this.audioContext.createOscillator();
     const gainNode = this.audioContext.createGain();
     const filter = this.audioContext.createBiquadFilter();
+    const panner = this.createPanner(sourceX, sourceY, 'inverse');
 
     osc.type = 'sawtooth';
     const baseFreq = state === 'chase' ? 120 : 80;
@@ -196,7 +264,7 @@ export class AudioSystem {
     filter.type = 'lowpass';
     filter.frequency.value = 500;
 
-    gainNode.gain.setValueAtTime(volume * distanceFactor, this.audioContext.currentTime);
+    gainNode.gain.setValueAtTime(volume, this.audioContext.currentTime);
     gainNode.gain.exponentialRampToValueAtTime(
       0.001,
       this.audioContext.currentTime + duration
@@ -204,7 +272,8 @@ export class AudioSystem {
 
     osc.connect(filter);
     filter.connect(gainNode);
-    gainNode.connect(this.masterGain);
+    gainNode.connect(panner);
+    panner.connect(this.masterGain);
 
     osc.start();
     osc.stop(this.audioContext.currentTime + duration);

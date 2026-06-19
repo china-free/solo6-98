@@ -14,6 +14,9 @@ export interface MaterialProperties {
   decayRate: number;
   echoCount: number;
   walkable: boolean;
+  refractiveIndex?: number;
+  transmission?: number;
+  soundSpeedMultiplier?: number;
 }
 
 export interface TerrainCell {
@@ -38,6 +41,8 @@ export interface WaveParticle {
   bounced: boolean;
   sourceType: WaveType;
   trail: { x: number; y: number; age: number }[];
+  inWater: boolean;
+  originalSpeed: number;
 }
 
 export interface Player {

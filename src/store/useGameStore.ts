@@ -55,10 +55,15 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
     engine.getWaveEngine().setOnWaveHeardCallback((x, y, amplitude, type) => {
       const playerPos = engine.getPlayerWorldPosition();
-      const dist = distance(x, y, playerPos.x, playerPos.y);
-      audio.playWaveSound(type, dist);
+      audio.playWaveSound(type, x, y, playerPos.x, playerPos.y);
+      audio.updateListenerPosition(playerPos.x, playerPos.y);
 
       engine.getMonsterAI().onWaveHeard(x, y, amplitude, type);
+    });
+
+    engine.getWaveEngine().setOnReflectionCallback((materialType, x, y, amplitude) => {
+      const playerPos = engine.getPlayerWorldPosition();
+      audio.playReflectionSound(materialType, x, y, playerPos.x, playerPos.y, amplitude);
     });
 
     set({
@@ -74,6 +79,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
     if (!gameEngine || !audioSystem) return;
 
     audioSystem.resume();
+    const playerPos = gameEngine.getPlayerWorldPosition();
+    audioSystem.updateListenerPosition(playerPos.x, playerPos.y);
     gameEngine.startGame();
   },
 
@@ -109,15 +116,22 @@ export const useGameStore = create<GameStore>((set, get) => ({
         lastPhase = 'lost';
       }
 
+      const playerPos = gameEngine.getPlayerWorldPosition();
+      audioSystem.updateListenerPosition(playerPos.x, playerPos.y);
+
       set({ gameState: state });
     });
 
     gameEngine.getWaveEngine().setOnWaveHeardCallback((x, y, amplitude, type) => {
       const playerPos = gameEngine.getPlayerWorldPosition();
-      const dist = distance(x, y, playerPos.x, playerPos.y);
-      audioSystem.playWaveSound(type, dist);
+      audioSystem.playWaveSound(type, x, y, playerPos.x, playerPos.y);
 
       gameEngine.getMonsterAI().onWaveHeard(x, y, amplitude, type);
+    });
+
+    gameEngine.getWaveEngine().setOnReflectionCallback((materialType, x, y, amplitude) => {
+      const playerPos = gameEngine.getPlayerWorldPosition();
+      audioSystem.playReflectionSound(materialType, x, y, playerPos.x, playerPos.y, amplitude);
     });
 
     set({ gameState: gameEngine.getState() });
